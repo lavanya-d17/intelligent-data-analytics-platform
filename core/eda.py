@@ -19,9 +19,10 @@ def datetime_cols(df: pd.DataFrame) -> list[str]:
 
 
 def categorical_cols(df: pd.DataFrame, max_unique: int = 50) -> list[str]:
+    skip = set(numeric_cols(df)) | set(datetime_cols(df))   # computed once, not once per column
     cols = []
     for c in df.columns:
-        if c in numeric_cols(df) or c in datetime_cols(df) or is_id_like(df[c], c):
+        if c in skip or is_id_like(df[c], c):
             continue
         if df[c].nunique(dropna=True) <= max_unique:
             cols.append(c)
@@ -45,9 +46,16 @@ def summary_categorical(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def boolean_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if pd.api.types.is_bool_dtype(df[c]) and df[c].nunique() == 2]
+
+
 def correlation(df: pd.DataFrame) -> pd.DataFrame:
-    cols = numeric_cols(df)
-    return df[cols].corr(numeric_only=True) if len(cols) >= 2 else pd.DataFrame()
+    """Correlation of number columns, plus True/False columns treated as 1/0."""
+    data = df[numeric_cols(df)].copy()
+    for c in boolean_cols(df):
+        data[c] = df[c].map(lambda v: float(v) if pd.notna(v) else np.nan)
+    return data.corr() if data.shape[1] >= 2 else pd.DataFrame()
 
 
 def _strength_word(r: float) -> str:
@@ -60,11 +68,12 @@ def generate_insights(df: pd.DataFrame, top_n: int = 10) -> list[str]:
     found: list[tuple[float, str]] = []
 
     corr = correlation(df)
-    cols = list(corr.columns)
+    cols, vals = list(corr.columns), corr.values
     for i, a in enumerate(cols):
-        for b in cols[i + 1:]:
-            r = corr.loc[a, b]
+        for j in range(i + 1, len(cols)):
+            r = vals[i][j]
             if pd.notna(r) and abs(r) >= 0.5:
+                b = cols[j]
                 direction = "positively" if r > 0 else "negatively"
                 found.append((abs(r), f"{a} and {b} are {_strength_word(r)} {direction} "
                                       f"correlated (r = {r:.2f})."))
@@ -92,6 +101,7 @@ def generate_insights(df: pd.DataFrame, top_n: int = 10) -> list[str]:
         if m >= 0.05:
             found.append((0.4 + m / 10, f"{c} is {m:.0%} missing."))
 
+    found.extend(_association_insights(df))
     found.sort(key=lambda t: t[0], reverse=True)
     return [text for _, text in found[:top_n]]
 
@@ -106,6 +116,7 @@ def guardrails(df: pd.DataFrame) -> list[str]:
     heavy = [c for c in df.columns if df[c].isna().mean() > 0.3]
     if heavy:
         w.append(f"Columns with over 30% missing values ({', '.join(heavy)}) may give misleading results.")
+    w.extend(_extra_guardrails(df))
     return w
 
 
@@ -154,3 +165,66 @@ def chart_for(df: pd.DataFrame, x: str, y: str | None = None):
     if y not in num and y not in dt and x in num:
         return px.box(df, x=y, y=x, title=f"{x} by {y}")
     return None
+
+
+# ---------------------------------------------------------------- Task 4.1 / 4.3 additions
+from scipy.stats import chi2_contingency  # noqa: E402
+
+
+def cramers_v(df: pd.DataFrame, a: str, b: str) -> float:
+    """Strength of association between two category columns: 0 = none, 1 = perfect."""
+    table = pd.crosstab(df[a], df[b])
+    if table.shape[0] < 2 or table.shape[1] < 2:
+        return 0.0
+    chi2 = chi2_contingency(table, correction=False)[0]
+    n = table.values.sum()
+    k = min(table.shape) - 1
+    return float(np.sqrt(chi2 / (n * k))) if n and k else 0.0
+
+
+def _association_insights(df: pd.DataFrame, min_v: float = 0.3, max_cols: int = 20) -> list[tuple[float, str]]:
+    cols = [c for c in categorical_cols(df) if 2 <= df[c].nunique() <= 12][:max_cols]
+    found = []
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            v = cramers_v(df, a, b)
+            if v >= min_v:
+                word = "strongly" if v >= 0.5 else "moderately"
+                found.append((v, f"{a} and {b} are {word} associated (Cram\u00e9r's V = {v:.2f})."))
+    return found
+
+
+def missing_matrix(df: pd.DataFrame, max_rows: int = 300):
+    """Heatmap of where values are missing (dark = missing)."""
+    if not df.isna().any().any():
+        return None
+    sample = df.sample(min(len(df), max_rows), random_state=0) if len(df) > max_rows else df
+    fig = px.imshow(sample.isna().astype(int).values, aspect="auto",
+                    labels=dict(x="column", y="row", color="missing"),
+                    x=list(sample.columns), color_continuous_scale=["#f0f0f0", "#c0392b"],
+                    title="Missing values (dark = missing)")
+    fig.update_coloraxes(showscale=False)
+    return fig
+
+
+def _extra_guardrails(df: pd.DataFrame) -> list[str]:
+    w = []
+    n = len(df)
+    for c in df.columns:
+        s = df[c].dropna()
+        if s.empty or is_id_like(df[c], c):
+            continue
+        if s.nunique() > 50 and s.nunique() < 0.9 * len(s) and not pd.api.types.is_numeric_dtype(s):
+            w.append(f"'{c}' has {s.nunique()} different values: too many groups to read in a chart.")
+        top_share = s.value_counts(normalize=True).iloc[0]
+        if s.nunique() > 1 and top_share > 0.95:
+            w.append(f"'{c}' has the same value in over 95% of rows; it says very little.")
+    if n >= 30:
+        for c in categorical_cols(df)[:12]:
+            small = df[c].value_counts()
+            small = small[small < 5]
+            if 0 < len(small) < df[c].nunique():
+                w.append(f"'{c}': group '{small.index[0]}' has only {int(small.iloc[0])} rows; "
+                         "do not compare it with much larger groups.")
+                break
+    return w

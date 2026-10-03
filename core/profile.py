@@ -6,8 +6,11 @@ import pandas as pd
 from core.utils import (
     is_id_like,
     is_text_dtype,
+    looks_boolean,
     looks_datetime,
     looks_numeric,
+    non_numeric_distinct,
+    numeric_share,
     null_token_mask,
     tidy_text,
 )
@@ -15,7 +18,8 @@ from core.utils import (
 MAX_CATEGORY_UNIQUE = 50  # only look for spelling variants in short category lists
 
 
-def _kind(s: pd.Series, numeric_text: bool, datetime_text: bool, id_like: bool = False) -> str:
+def _kind(s: pd.Series, numeric_text: bool, datetime_text: bool, id_like: bool = False,
+          boolean_text: bool = False) -> str:
     if id_like:
         return "id"
     if pd.api.types.is_bool_dtype(s):
@@ -24,6 +28,8 @@ def _kind(s: pd.Series, numeric_text: bool, datetime_text: bool, id_like: bool =
         return "datetime"
     if pd.api.types.is_numeric_dtype(s):
         return "numeric"
+    if boolean_text:
+        return "boolean_text"
     if numeric_text:
         return "numeric_text"
     if datetime_text:
@@ -52,7 +58,11 @@ def profile_column(s: pd.Series, name: str | None = None) -> dict:
     tokens = int(null_token_mask(s).sum()) if text else 0
     num_text = looks_numeric(s)
     dt_text = looks_datetime(s) if not num_text else False
-    kind = _kind(s, num_text, dt_text, is_id_like(s, name))
+    bool_text = looks_boolean(s)
+    kind = _kind(s, num_text, dt_text, is_id_like(s, name), bool_text)
+    share = numeric_share(s)
+    mixed = bool(text and kind in ("categorical", "text") and 0.1 <= share < 0.8
+                 and non_numeric_distinct(s) <= 20)  # many different words = a code column, not a typo
 
     info = {
         "dtype": str(s.dtype),
@@ -61,6 +71,8 @@ def profile_column(s: pd.Series, name: str | None = None) -> dict:
         "missing_pct": round(float(s.isna().mean() * 100), 2) if n else 0.0,
         "null_tokens": tokens,
         "unique": int(s.nunique(dropna=True)),
+        "constant": bool(s.nunique(dropna=True) == 1),
+        "mixed": mixed,
         "outliers": 0,
         "outlier_pct": 0.0,
         "skew": None,
@@ -98,9 +110,11 @@ def profile(df: pd.DataFrame) -> dict:
     flagged = sum(
         1
         for i in cols.values()
-        if i["kind"] in ("numeric_text", "datetime_text")
+        if i["kind"] in ("numeric_text", "datetime_text", "boolean_text")
+        or i["mixed"]
         or i["variants"]
         or i["null_tokens"]
+        or i["constant"]
         or i["outlier_pct"] > 5
     )
     score = 100 - min(40, missing_pct * 1.5) - min(20, dup_pct * 2) - min(40, 40 * flagged / max(n_cols, 1))
@@ -142,6 +156,10 @@ def suggest_fixes(prof: dict) -> list[dict]:
         if i["kind"] == "numeric_text":
             steps.append({"op": "convert_numeric", "col": c,
                           "reason": f"'{c}' is stored as text but looks numeric (e.g. '1,200')."})
+        elif i["kind"] == "boolean_text":
+            steps.append({"op": "convert_boolean", "col": c,
+                          "reason": f"'{c}' holds yes/no style answers stored as text; "
+                                    "convert them to True/False."})
         elif i["kind"] == "datetime_text":
             steps.append({"op": "convert_datetime", "col": c, "dayfirst": True,
                           "reason": f"'{c}' is stored as text but looks like dates (day-first assumed)."})
@@ -151,7 +169,13 @@ def suggest_fixes(prof: dict) -> list[dict]:
                           "reason": f"'{c}' has inconsistent spellings, e.g. {ex}."})
 
     for c, i in cols.items():
-        pending = i["kind"] in ("numeric_text", "datetime_text") or i["variants"] or i["null_tokens"]
+        if i["constant"]:
+            steps.append({"op": "drop_column", "col": c,
+                          "reason": f"'{c}' has the same value in every row, so it adds no information."})
+
+    for c, i in cols.items():
+        pending = (i["kind"] in ("numeric_text", "datetime_text", "boolean_text") or i["variants"]
+                   or i["null_tokens"] or i["constant"])
         if i["missing"] == 0 or pending:
             continue
         if i["missing_pct"] > 60:
@@ -192,6 +216,10 @@ def describe_step(step: dict) -> str:
         "normalize_missing": "Convert placeholders to missing values",
         "convert_numeric": f"Convert '{col}' to numbers",
         "convert_datetime": f"Convert '{col}' to dates",
+        "convert_boolean": f"Convert '{col}' to True/False",
+        "drop_rows_missing": f"Drop rows with more than {int(step.get('threshold', 0.5) * 100)}% missing values",
+        "replace_values": f"Replace values in '{col}'",
+        "rename_column": f"Rename '{col}' to '{step.get('new_name')}'",
         "standardize_categories": f"Standardize spellings in '{col}'",
         "drop_column": f"Drop column '{col}'",
         "impute": f"Fill missing '{col}' with {step.get('method')}",
