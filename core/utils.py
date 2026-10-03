@@ -96,3 +96,63 @@ def is_id_like(s: pd.Series, name: str | None = None) -> bool:
     named = bool(_ID_NAME_RE.search(str(name if name is not None else s.name or "")))
     sequential = pd.api.types.is_integer_dtype(s) and (s.max() - s.min() + 1) == n
     return named or sequential
+
+
+TRUE_WORDS = {"yes", "y", "true", "t", "1", "1.0"}
+FALSE_WORDS = {"no", "n", "false", "f", "0", "0.0"}
+
+
+def to_boolean_loose(s: pd.Series) -> pd.Series:
+    """yes/no, y/n, true/false, 1/0 -> True/False. Anything else becomes missing."""
+
+    def conv(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        if isinstance(v, bool):
+            return v
+        t = str(v).strip().lower()
+        if t in TRUE_WORDS:
+            return True
+        if t in FALSE_WORDS:
+            return False
+        return None
+
+    base = s.astype(object).where(~null_token_mask(s), None)
+    return base.map(conv).astype("boolean")
+
+
+def looks_boolean(s: pd.Series) -> bool:
+    """Text column whose values are all yes/no style answers (at least one is a word)."""
+    if not is_text_dtype(s):
+        return False
+    vals = s.dropna()
+    vals = vals[~null_token_mask(vals)]
+    if vals.empty:
+        return False
+    words = vals.map(lambda v: str(v).strip().lower())
+    if not words.isin(TRUE_WORDS | FALSE_WORDS).all():
+        return False
+    return bool(words.str.contains("[a-z]").any())
+
+
+def numeric_share(s: pd.Series) -> float:
+    """Fraction of a text column's filled values that are really numbers."""
+    if not is_text_dtype(s):
+        return 0.0
+    vals = s.dropna()
+    vals = vals[~null_token_mask(vals)]
+    if vals.empty:
+        return 0.0
+    return float(to_numeric_loose(vals).notna().mean())
+
+
+def non_numeric_distinct(s: pd.Series) -> int:
+    """How many different non-number values a text column contains."""
+    if not is_text_dtype(s):
+        return 0
+    vals = s.dropna()
+    vals = vals[~null_token_mask(vals)]
+    if vals.empty:
+        return 0
+    words = vals[to_numeric_loose(vals).isna()]
+    return int(words.nunique())

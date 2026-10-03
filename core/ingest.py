@@ -1,6 +1,7 @@
 """Loading files into DataFrames with friendly errors."""
 from __future__ import annotations
 
+import csv
 import io
 
 import pandas as pd
@@ -12,19 +13,37 @@ class IngestError(Exception):
     """Raised with a message that is safe to show directly to the user."""
 
 
+def _detect_sep(sample: str) -> str:
+    """Comma, semicolon, tab or pipe. Falls back to a comma (e.g. for a one-column file)."""
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        return ","
+
+
 def _read_text(raw: bytes) -> pd.DataFrame:
     last_err: Exception | None = None
     for enc in ("utf-8-sig", "latin-1"):
         try:
-            # sep=None lets pandas sniff the delimiter (comma, semicolon, tab ...)
-            return pd.read_csv(io.BytesIO(raw), sep=None, engine="python", encoding=enc)
+            sep = _detect_sep(raw[:20000].decode(enc, errors="ignore"))
+            return pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc)
         except UnicodeDecodeError as e:
             last_err = e
     raise IngestError(f"Could not decode the file: {last_err}")
 
 
-def load_file(file, name: str | None = None) -> pd.DataFrame:
-    """Load a CSV/TSV/TXT/Excel upload (file-like object or bytes)."""
+def list_sheets(file_bytes: bytes) -> list[str]:
+    """Names of the sheets in an Excel file."""
+    try:
+        return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+    except Exception as e:
+        raise IngestError(f"Could not read the Excel file: {e}") from e
+
+
+def load_file(file, name: str | None = None, sheet: str | None = None) -> pd.DataFrame:
+    """Load a CSV/TSV/TXT/Excel upload (file-like object or bytes).
+
+    For Excel files, `sheet` picks the sheet by name (default: the first one)."""
     name = (name or getattr(file, "name", "") or "").lower()
     raw = file.read() if hasattr(file, "read") else file
 
@@ -35,7 +54,7 @@ def load_file(file, name: str | None = None) -> pd.DataFrame:
 
     try:
         if name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(io.BytesIO(raw))
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet if sheet else 0)
         elif name.endswith((".csv", ".tsv", ".txt")):
             df = _read_text(raw)
         else:
