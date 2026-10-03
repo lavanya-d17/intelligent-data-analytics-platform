@@ -16,7 +16,7 @@ import streamlit as st
 
 from core import eda
 from core.clean import apply_step, replay
-from core.ingest import IngestError, load_file
+from core.ingest import IngestError, list_sheets, load_file
 from core.profile import describe_step, profile, suggest_fixes
 
 SAMPLE_PATH = ROOT / "data" / "samples" / "messy_sales.csv"
@@ -30,6 +30,7 @@ def init_state():
     st.session_state.setdefault("raw_df", None)
     st.session_state.setdefault("filename", None)
     st.session_state.setdefault("steps", [])
+    st.session_state.setdefault("last_upload_key", None)
 
 
 def set_dataset(df: pd.DataFrame, name: str):
@@ -75,12 +76,26 @@ def page_upload():
     st.write("Supported formats: CSV, TSV, TXT, Excel (.xlsx). Max 100 MB.")
 
     up = st.file_uploader("Choose a file", type=["csv", "tsv", "txt", "xlsx", "xls"])
-    if up is not None and st.session_state.filename != up.name:
-        try:
-            set_dataset(load_file(up, up.name), up.name)
-            st.success(f"Loaded {up.name}")
-        except IngestError as e:
-            st.error(str(e))
+    if up is not None:
+        data = up.getvalue()
+        sheet, readable = None, True
+        if up.name.lower().endswith((".xlsx", ".xls")):
+            try:
+                sheets = list_sheets(data)
+                if len(sheets) > 1:
+                    sheet = st.selectbox("This workbook has several sheets. Pick one:", sheets)
+            except IngestError as e:
+                st.error(str(e))
+                readable = False
+        key = f"{up.name}|{sheet}"
+        if readable and st.session_state.last_upload_key != key:
+            try:
+                label = up.name if sheet is None else f"{up.name} [{sheet}]"
+                set_dataset(load_file(data, up.name, sheet=sheet), label)
+                st.session_state.last_upload_key = key
+                st.success(f"Loaded {label}")
+            except IngestError as e:
+                st.error(str(e))
 
     if st.button("Use the sample messy dataset"):
         set_dataset(load_file(io.BytesIO(SAMPLE_PATH.read_bytes()), SAMPLE_PATH.name), SAMPLE_PATH.name)
@@ -120,6 +135,12 @@ def render_profile(df: pd.DataFrame, title: str):
             issues.append(f"{i['null_tokens']} placeholders (N/A, -, ...)")
         if i["variants"]:
             issues.append("inconsistent spellings")
+        if i["kind"] == "boolean_text":
+            issues.append("yes/no answers stored as text")
+        if i["mixed"]:
+            issues.append("numbers and words mixed together (review by hand)")
+        if i["constant"]:
+            issues.append("same value in every row")
         if i["outlier_pct"] > 1:
             issues.append(f"{i['outliers']} outliers")
         rows.append({"column": name, "type": i["kind"], "missing": i["missing"],

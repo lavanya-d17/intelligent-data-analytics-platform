@@ -10,13 +10,14 @@ import pandas as pd
 from core.utils import (
     null_token_mask,
     tidy_text,
+    to_boolean_loose,
     to_datetime_loose,
     to_numeric_loose,
 )
 
-COLUMN_OPS = {"convert_numeric", "convert_datetime", "standardize_categories",
-              "impute", "cap_outliers"}
-ALL_OPS = COLUMN_OPS | {"drop_duplicates", "normalize_missing", "drop_column"}
+COLUMN_OPS = {"convert_numeric", "convert_datetime", "convert_boolean", "standardize_categories",
+              "impute", "cap_outliers", "replace_values", "rename_column"}
+ALL_OPS = COLUMN_OPS | {"drop_duplicates", "normalize_missing", "drop_column", "drop_rows_missing"}
 
 
 def _require_col(df: pd.DataFrame, col: str | None) -> str:
@@ -51,10 +52,34 @@ def apply_step(df: pd.DataFrame, step: dict) -> pd.DataFrame:
     if op == "drop_column":
         return out.drop(columns=[step["col"]], errors="ignore")
 
+    if op == "drop_rows_missing":
+        threshold = float(step.get("threshold", 0.5))
+        if not 0 < threshold <= 1:
+            raise ValueError("threshold must be greater than 0 and at most 1")
+        keep = out.isna().mean(axis=1) <= threshold
+        return out[keep].reset_index(drop=True)
+
     col = _require_col(out, step.get("col"))
 
     if op == "convert_numeric":
         out[col] = to_numeric_loose(out[col])
+
+    elif op == "convert_boolean":
+        out[col] = to_boolean_loose(out[col])
+
+    elif op == "replace_values":
+        mapping = step.get("mapping")
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("replace_values needs a non-empty 'mapping' dictionary")
+        out[col] = out[col].map(lambda v: mapping.get(v, v))
+
+    elif op == "rename_column":
+        new_name = str(step.get("new_name", "")).strip()
+        if not new_name:
+            raise ValueError("rename_column needs a 'new_name'")
+        if new_name != col and new_name in out.columns:
+            raise ValueError(f"A column called '{new_name}' already exists")
+        out = out.rename(columns={col: new_name})
 
     elif op == "convert_datetime":
         out[col] = to_datetime_loose(out[col], dayfirst=step.get("dayfirst", True))

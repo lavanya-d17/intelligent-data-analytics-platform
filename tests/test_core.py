@@ -161,3 +161,86 @@ def test_chart_for_date_vs_number_either_order():
     df = pd.DataFrame({"d": pd.date_range("2024-01-01", periods=30), "v": np.arange(30.0)})
     assert chart_for(df, "d", "v") is not None
     assert chart_for(df, "v", "d") is not None   # used to show "No suitable chart"
+
+
+def test_constant_column_is_flagged_and_dropped():
+    df = pd.DataFrame({"Country": ["India"] * 12, "Score": list(range(12))})
+    info = profile(df)["columns"]["Country"]
+    assert info["constant"] is True
+    ops = [(s["op"], s.get("col")) for s in suggest_fixes(profile(df))]
+    assert ("drop_column", "Country") in ops
+    # a normal column is not flagged
+    assert profile(df)["columns"]["Score"]["constant"] is False
+
+
+# ---------- v3: mixed types, booleans, new ops, Excel ----------
+def test_boolean_text_detected_converted_and_suggested():
+    df = pd.DataFrame({"Member": ["Yes", "no", "Y", "N", None, "yes", "No", "YES", "n", "y", "no", "yes"]})
+    info = profile(df)["columns"]["Member"]
+    assert info["kind"] == "boolean_text"
+    assert ("convert_boolean", "Member") in [(s["op"], s.get("col")) for s in suggest_fixes(profile(df))]
+    out = apply_step(df, {"op": "convert_boolean", "col": "Member"})
+    assert out["Member"].iloc[0] is True or bool(out["Member"].iloc[0]) is True
+    assert bool(out["Member"].iloc[1]) is False
+    assert out["Member"].isna().sum() == 1
+    # a plain 1/0 text column is treated as numbers, not yes/no
+    nums = pd.DataFrame({"x": ["1", "0", "1", "0"] * 3})
+    assert profile(nums)["columns"]["x"]["kind"] == "numeric_text"
+
+
+def test_mixed_type_column_is_flagged_but_not_auto_fixed():
+    df = pd.DataFrame({"Code": ["10", "abc", "20", "xyz", "30", "pqr", "40", "lmn", "50", "def"]})
+    info = profile(df)["columns"]["Code"]
+    assert info["mixed"] is True
+    assert not [s for s in suggest_fixes(profile(df)) if s.get("col") == "Code" and s["op"] == "convert_numeric"]
+    clean = pd.DataFrame({"Code": ["a", "b", "c", "d"] * 3})
+    assert profile(clean)["columns"]["Code"]["mixed"] is False
+
+
+def test_drop_rows_missing():
+    df = pd.DataFrame({"a": [1, None, 3, None], "b": [1, None, 3, 4], "c": [1, None, None, 4]})
+    out = apply_step(df, {"op": "drop_rows_missing", "threshold": 0.5})
+    assert len(out) == 3                      # only the row with 100% missing is removed
+    with pytest.raises(ValueError):
+        apply_step(df, {"op": "drop_rows_missing", "threshold": 0})
+
+
+def test_replace_values_and_rename_column():
+    df = pd.DataFrame({"City": ["Bombay", "Delhi", "Bombay"]})
+    out = apply_step(df, {"op": "replace_values", "col": "City", "mapping": {"Bombay": "Mumbai"}})
+    assert list(out["City"]) == ["Mumbai", "Delhi", "Mumbai"]
+    with pytest.raises(ValueError):
+        apply_step(df, {"op": "replace_values", "col": "City", "mapping": {}})
+    out = apply_step(df, {"op": "rename_column", "col": "City", "new_name": "Town"})
+    assert list(out.columns) == ["Town"]
+    two = pd.DataFrame({"a": [1], "b": [2]})
+    with pytest.raises(ValueError):
+        apply_step(two, {"op": "rename_column", "col": "a", "new_name": "b"})
+
+
+def test_pipeline_with_all_new_ops_replays_identically(tmp_path):
+    df = pd.DataFrame({"Member": ["yes", "no", None, "yes"], "City": ["Bombay", "Delhi", "Bombay", None],
+                       "x": [1.0, None, None, None]})
+    steps = [{"op": "convert_boolean", "col": "Member"},
+             {"op": "replace_values", "col": "City", "mapping": {"Bombay": "Mumbai"}},
+             {"op": "drop_rows_missing", "threshold": 0.6},
+             {"op": "rename_column", "col": "City", "new_name": "Town"}]
+    import json
+    steps = json.loads(json.dumps(steps))     # same as saving and loading pipeline.json
+    a, b = replay(df, steps), replay(df, steps)
+    pd.testing.assert_frame_equal(a, b)
+    assert "Town" in a.columns
+
+
+def test_excel_sheet_selection():
+    from core.ingest import list_sheets
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame({"a": [1, 2]}).to_excel(w, sheet_name="First", index=False)
+        pd.DataFrame({"b": [3, 4, 5]}).to_excel(w, sheet_name="Second", index=False)
+    data = buf.getvalue()
+    assert list_sheets(data) == ["First", "Second"]
+    assert list(load_file(data, "x.xlsx").columns) == ["a"]                      # default: first
+    assert list(load_file(data, "x.xlsx", sheet="Second").columns) == ["b"]
+    with pytest.raises(IngestError):
+        list_sheets(b"not an excel file")

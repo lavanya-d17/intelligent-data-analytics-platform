@@ -23,8 +23,18 @@ def _read_text(raw: bytes) -> pd.DataFrame:
     raise IngestError(f"Could not decode the file: {last_err}")
 
 
-def load_file(file, name: str | None = None) -> pd.DataFrame:
-    """Load a CSV/TSV/TXT/Excel upload (file-like object or bytes)."""
+def list_sheets(file_bytes: bytes) -> list[str]:
+    """Names of the sheets in an Excel file."""
+    try:
+        return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+    except Exception as e:
+        raise IngestError(f"Could not read the Excel file: {e}") from e
+
+
+def load_file(file, name: str | None = None, sheet: str | None = None) -> pd.DataFrame:
+    """Load a CSV/TSV/TXT/Excel upload (file-like object or bytes).
+
+    For Excel files, `sheet` picks the sheet by name (default: the first one)."""
     name = (name or getattr(file, "name", "") or "").lower()
     raw = file.read() if hasattr(file, "read") else file
 
@@ -35,7 +45,7 @@ def load_file(file, name: str | None = None) -> pd.DataFrame:
 
     try:
         if name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(io.BytesIO(raw))
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet if sheet else 0)
         elif name.endswith((".csv", ".tsv", ".txt")):
             df = _read_text(raw)
         else:
